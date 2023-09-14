@@ -61,8 +61,8 @@ func (r *CoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 	coop := &utilv1.Coop{}
 	err := r.Get(ctx, req.NamespacedName, coop)
 	if err != nil {
-		log.Error(err, "Failed to fetch Coop")
-		// this is more succint than checking if err != IsNotFound(err) and returning nil
+		log.Info("Failed to fetch Coop. Ignoring, as object is probably deleted")
+		// this is more succinct than checking if err != IsNotFound(err) and returning nil
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
@@ -86,6 +86,7 @@ func (r *CoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
+	log.Info("Found Coop: reconciling [partFinalizer]") // debugging only
 	if !controllerutil.ContainsFinalizer(coop, coopFinalizer) {
 
 		log.Info("Adding finalizer for Coop")
@@ -103,6 +104,7 @@ func (r *CoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		}
 	}
 
+	log.Info("Found Coop: reconciling [partDeletionTimestamp]") // debugging only
 	coopIsMarkedForDeletion := coop.GetDeletionTimestamp() != nil
 	if coopIsMarkedForDeletion {
 		if controllerutil.ContainsFinalizer(coop, coopFinalizer) {
@@ -157,45 +159,49 @@ func (r *CoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 
 	// copyConfigMap i.e. update targets
 
-	// 1. Check if the config map already exists
-	v1ConfigMap := &v1.ConfigMap{}
-	err = r.Get(ctx, types.NamespacedName{Name: coop.Spec.Source.Name, Namespace: coop.Spec.Destination.Namespace}, v1ConfigMap)
-	if err != nil && errors.IsNotFound(err) {
+	// 1. Check if the source config map already exists
+	log.Info("Found Coop: reconciling [FindingConfigMap]") // debugging only
+	sourceConfigMap := &v1.ConfigMap{}
+	err = r.Get(ctx, types.NamespacedName{Name: coop.Spec.Source.Name, Namespace: coop.Spec.Source.Namespace}, sourceConfigMap)
+	if err == nil {
+		// 1a. if the source config map exists then
+		log.Info("Found ConfigMap in source Namespace")
 
-		// 2. Assuming the config map doesn't exist copy it
-		newConfigMap := &v1.ConfigMap{
-			TypeMeta: metav1.TypeMeta{
-				Kind:       "ConfigMap",
-				APIVersion: "v1",
-			},
-			ObjectMeta: metav1.ObjectMeta{
-				Name:      coop.Spec.Source.Name,
-				Namespace: coop.Spec.Destination.Namespace,
-			},
-			Data: v1ConfigMap.Data,
+		v1ConfigMap := &v1.ConfigMap{}
+		// 1b. Now we need to check if the configmap already exists in the destination!
+		log.Info("Checking the destination namespace")
+		err = r.Get(ctx, types.NamespacedName{Name: coop.Spec.Source.Name, Namespace: coop.Spec.Destination.Namespace}, v1ConfigMap)
+		if err != nil && errors.IsNotFound(err) {
+			log.Info("Destination namespace was empty so creating configmap shortly")
+			newConfigMap := sourceConfigMap.DeepCopy()
+			newConfigMap.Namespace = coop.Spec.Destination.Namespace
+			newConfigMap.ResourceVersion = ""
+
+			//if err := ctrl.SetControllerReference(coop, newConfigMap, r.Scheme); err != nil {
+			//	log.Error(err, "Failed to set ConfigMap owner to Coop")
+			//	return ctrl.Result{}, err
+			//}
+
+			log.Info(fmt.Sprintf("Copying %q ConfigMap from %q namespace to %q namespace", coop.Spec.Source.Name, coop.Spec.Source.Namespace, coop.Spec.Destination.Namespace))
+			// 3. Attempt to create a new config map in the destination namespace
+			if err = r.Create(ctx, newConfigMap); err != nil {
+				log.Error(err, "Failed to create a new config map at destination")
+				return ctrl.Result{}, err
+			}
+
+			log.Info("Found Coop: reconciling [EndOfConfigMapCheck]")
+			// requeue after 5 seconds to ensure configmap created
+			return ctrl.Result{RequeueAfter: time.Second * 5}, nil
 		}
-
-		log.Info(fmt.Sprintf("Copying %q ConfigMap from %q namespace to %q namespace", coop.Spec.Source.Name, coop.Spec.Source.Namespace, coop.Spec.Destination.Namespace))
-		// 3. Attempt to create a new config map in the destination namespace
-		if err = r.Create(ctx, newConfigMap); err != nil {
-			log.Error(err, "Failed to create a new config map at destination")
-			return ctrl.Result{}, err
-		}
-
-		// requeue after 10 seconds to ensure configmap created
-		return ctrl.Result{RequeueAfter: time.Second * 10}, nil
-
-	} else if err != nil {
-		log.Error(err, "Failed to get Coop Source configMap")
-		return ctrl.Result{}, err
 	}
-
-	return ctrl.Result{}, nil
+	log.Info("*******END OF RECONCILIATION LOOP******")
+	return ctrl.Result{RequeueAfter: time.Second * 10}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *CoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&utilv1.Coop{}).
+		Owns(&v1.ConfigMap{}).
 		Complete(r)
 }

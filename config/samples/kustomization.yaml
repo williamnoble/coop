@@ -1,0 +1,4 @@
+## Append samples of your project ##
+resources:
+- util_v1_coop.yaml
+#+kubebuilder:scaffold:manifestskustomizesamples

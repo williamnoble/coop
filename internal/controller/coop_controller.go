@@ -19,20 +19,19 @@ package controller
 import (
 	"context"
 	"fmt"
-	v1 "k8s.io/api/core/v1"
+	corev1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/types"
-	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
-	"time"
-
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"time"
 
-	utilv1 "github.com/williamnoble/coop/api/v1"
+	apiv1 "github.com/williamnoble/coop/api/v1"
 )
 
 // CoopReconciler reconciles a Coop object
@@ -58,14 +57,15 @@ const (
 // - https://pkg.go.dev/sigs.k8s.io/controller-runtime@v0.14.4/pkg/reconcile
 func (r *CoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Result, error) {
 	log := log.FromContext(ctx)
-	coop := &utilv1.Coop{}
+
+	coop := &apiv1.Coop{}
 	err := r.Get(ctx, req.NamespacedName, coop)
 	if err != nil {
-		log.Info("Failed to fetch Coop. Ignoring, as object is probably deleted")
-		// this is more succinct than checking if err != IsNotFound(err) and returning nil
+		log.Info("Failed to fetch Coop object. Ignoring, probably deleted")
 		return ctrl.Result{}, client.IgnoreNotFound(err)
 	}
 
+	log.V(1).Info("Updating Status Condition")
 	if len(coop.Status.Conditions) == 0 {
 		meta.SetStatusCondition(&coop.Status.Conditions,
 			metav1.Condition{
@@ -76,40 +76,43 @@ func (r *CoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 			})
 
 		if err := r.Status().Update(ctx, coop); err != nil {
+			if errors.IsConflict(err) {
+				log.Info("Resource conflict detected, re-queuing")
+				return ctrl.Result{Requeue: true}, nil
+			}
 			log.Error(err, "Failed to update coop status")
-			return ctrl.Result{}, err // requeue
+			return ctrl.Result{}, err
 		}
 
 		if err := r.Get(ctx, req.NamespacedName, coop); err != nil {
-			log.Error(err, "Failed to re-fetch Coop")
+			log.Error(err, "Failed to fetch Coop after updating conditions")
 			return ctrl.Result{}, err
 		}
 	}
 
-	log.Info("Found Coop: reconciling [partFinalizer]") // debugging only
+	log.V(1).Info("Updating Finalizer")
 	if !controllerutil.ContainsFinalizer(coop, coopFinalizer) {
-
-		log.Info("Adding finalizer for Coop")
+		log.Info("Adding finalizer")
 		if ok := controllerutil.AddFinalizer(coop, coopFinalizer); !ok {
-			log.Info("ONE")
-			log.Error(err, "Failed to add finalizer to coop")
-			log.Info("TWO")
-			return ctrl.Result{Requeue: true}, nil // bool so requeue as no err
+			log.Error(err, "Failed to add finalizer")
+			return ctrl.Result{Requeue: true}, nil
 		}
 
 		if err := r.Update(ctx, coop); err != nil {
-			log.Info("THREE")
 			log.Error(err, "Failed to update Coop and add finalizer")
 			return ctrl.Result{}, err
 		}
 	}
 
-	log.Info("Found Coop: reconciling [partDeletionTimestamp]") // debugging only
 	coopIsMarkedForDeletion := coop.GetDeletionTimestamp() != nil
 	if coopIsMarkedForDeletion {
+		log.V(1).Info("Marked for deletion")
 		if controllerutil.ContainsFinalizer(coop, coopFinalizer) {
-			log.Info("Found Coop finalizer, performing cleanup of resources")
-			// perform some cleanup, delete configmaps
+			err := r.cleanupResources(ctx, coop)
+			if err != nil {
+				log.Error(err, "Failed to clean up resources")
+				return ctrl.Result{}, err
+			}
 		}
 
 		meta.SetStatusCondition(&coop.Status.Conditions, metav1.Condition{
@@ -120,7 +123,11 @@ func (r *CoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		})
 
 		if err := r.Status().Update(ctx, coop); err != nil {
-			log.Error(err, "Failed to update Coop status")
+			if errors.IsConflict(err) {
+				log.Info("Resource conflict detected, re-queuing")
+				return ctrl.Result{Requeue: true}, nil
+			}
+			log.Error(err, "Failed to update coop status")
 			return ctrl.Result{}, err
 		}
 
@@ -137,7 +144,11 @@ func (r *CoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		})
 
 		if err := r.Status().Update(ctx, coop); err != nil {
-			log.Error(err, "Failed to update Coop status")
+			if errors.IsConflict(err) {
+				log.Info("Resource conflict detected, requeuing")
+				return ctrl.Result{Requeue: true}, nil
+			}
+			log.Error(err, "Failed to update coop status")
 			return ctrl.Result{}, err
 		}
 
@@ -155,53 +166,82 @@ func (r *CoopReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.
 		return ctrl.Result{}, nil
 	}
 
-	// validate Spec
+	if err := validateSpec(coop); err != nil {
+		log.Error(err, "Encountered an error reading the coop spec")
+		return ctrl.Result{}, err
+	}
 
-	// copyConfigMap i.e. update targets
-
-	// 1. Check if the source config map already exists
-	log.Info("Found Coop: reconciling [FindingConfigMap]") // debugging only
-	sourceConfigMap := &v1.ConfigMap{}
+	log.V(1).Info("Performing main reconciliation logic")
+	// check if the source config map already exists
+	sourceConfigMap := &corev1.ConfigMap{}
 	err = r.Get(ctx, types.NamespacedName{Name: coop.Spec.Source.Name, Namespace: coop.Spec.Source.Namespace}, sourceConfigMap)
 	if err == nil {
-		// 1a. if the source config map exists then
+		// if the source config map exists
 		log.Info("Found ConfigMap in source Namespace")
 
-		v1ConfigMap := &v1.ConfigMap{}
-		// 1b. Now we need to check if the configmap already exists in the destination!
+		configMap := &corev1.ConfigMap{}
+		// we need to check if the configmap already exists in the destination
 		log.Info("Checking the destination namespace")
-		err = r.Get(ctx, types.NamespacedName{Name: coop.Spec.Source.Name, Namespace: coop.Spec.Destination.Namespace}, v1ConfigMap)
+		err = r.Get(ctx, types.NamespacedName{Name: coop.Spec.Source.Name, Namespace: coop.Spec.Destination.Namespace}, configMap)
 		if err != nil && errors.IsNotFound(err) {
 			log.Info("Destination namespace was empty so creating configmap shortly")
 			newConfigMap := sourceConfigMap.DeepCopy()
 			newConfigMap.Namespace = coop.Spec.Destination.Namespace
 			newConfigMap.ResourceVersion = ""
 
-			//if err := ctrl.SetControllerReference(coop, newConfigMap, r.Scheme); err != nil {
-			//	log.Error(err, "Failed to set ConfigMap owner to Coop")
-			//	return ctrl.Result{}, err
-			//}
-
 			log.Info(fmt.Sprintf("Copying %q ConfigMap from %q namespace to %q namespace", coop.Spec.Source.Name, coop.Spec.Source.Namespace, coop.Spec.Destination.Namespace))
-			// 3. Attempt to create a new config map in the destination namespace
+
+			// attempt to create a new config map in the destination namespace
 			if err = r.Create(ctx, newConfigMap); err != nil {
 				log.Error(err, "Failed to create a new config map at destination")
 				return ctrl.Result{}, err
 			}
 
 			log.Info("Found Coop: reconciling [EndOfConfigMapCheck]")
-			// requeue after 5 seconds to ensure configmap created
+			// requeue after 5 seconds to ensure the configmap created
 			return ctrl.Result{RequeueAfter: time.Second * 5}, nil
 		}
 	}
-	log.Info("*******END OF RECONCILIATION LOOP******")
+	log.V(1).Info("Completed Reconcilliaton Loop")
 	return ctrl.Result{RequeueAfter: time.Second * 10}, nil
 }
 
 // SetupWithManager sets up the controller with the Manager.
 func (r *CoopReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
-		For(&utilv1.Coop{}).
-		Owns(&v1.ConfigMap{}).
+		For(&apiv1.Coop{}).
 		Complete(r)
+}
+
+func validateSpec(c *apiv1.Coop) error {
+	if c.Spec.Source.Namespace == "" || c.Spec.Destination.Namespace == "" || c.Spec.Source.Name == "" {
+		return fmt.Errorf("invalid Spec\n")
+	}
+
+	return nil
+}
+
+func (r *CoopReconciler) cleanupResources(ctx context.Context, coop *apiv1.Coop) error {
+	log := log.FromContext(ctx)
+
+	configMap := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{
+		Name:      coop.Spec.Source.Name,
+		Namespace: coop.Spec.Destination.Namespace,
+	}, configMap)
+
+	if err == nil {
+		log.Info("Deleting ConfigMap from destination namespace as part of cleanup",
+			"namespace", coop.Spec.Destination.Namespace,
+			"name", coop.Spec.Source.Name)
+
+		if err = r.Delete(ctx, configMap); err != nil {
+			log.Error(err, "Failed to delete ConfigMap during cleanup")
+			return err
+		}
+	} else if !errors.IsNotFound(err) {
+		return err
+	}
+
+	return nil
 }

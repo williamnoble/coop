@@ -1,9 +1,9 @@
 # coop
-Coop is an operator that manages a Copy Operation CR. Coop allows the cluster user to specify a ConfigMap and have that
-ConfigMap replicated to a namespace.
+Coop is an operator that manages a **Co**py **Op**eration. Coop allows the cluster user to specify a ConfigMap and have that
+ConfigMap replicated to a namespace. Though if you're from the UK, you're probably thinking why pick the name of a supermarket:)
 
 ## Description
-// TODO(user): An in-depth paragraph about your project and overview of use
+A User provides a Copy Operation Custom Resource which defines where to copy either a Config Map. 
 
 ## Getting Started
 You’ll need a Kubernetes cluster to run against. You can use [KIND](https://sigs.k8s.io/kind) to get a local cluster for testing, or run against a remote cluster.
